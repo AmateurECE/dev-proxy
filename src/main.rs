@@ -14,6 +14,10 @@ use core::convert::Infallible;
 use core::task::{Context, Poll};
 use core::future::{self, Future};
 use core::pin::Pin;
+
+use std::env::current_dir;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use hyper::{
@@ -29,6 +33,7 @@ use hyper::{
 // Proxy
 ////
 
+#[derive(Clone)]
 struct ProxyRoute {
     route: String,
     proxy: Uri,
@@ -45,7 +50,16 @@ impl ProxyRoute {
     }
 
     pub fn proxy(&self, request: Request<Body>) -> ResponseFuture {
-        self.client.request(request)
+        let uri: Uri = (
+            self.route.to_string()
+                + request.uri().path().strip_prefix(&self.route).unwrap())
+            .parse().unwrap();
+        let proxy_request = Request::builder()
+            .method(request.method())
+            .uri(uri)
+            .body(request.into_body())
+            .unwrap();
+        self.client.request(proxy_request)
     }
 }
 
@@ -58,11 +72,35 @@ struct StaticFileFuture {
 }
 
 impl Future for StaticFileFuture {
-    type Output = Response<Body>;
+    type Output = io::Result<Response<Body>>;
     fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) ->
         Poll<Self::Output>
     {
-        unimplemented!()
+        use io::ErrorKind::*;
+
+        let result = File::open(&self.path);
+        let response = match result {
+            Ok(mut file) => {
+                let mut contents = String::new();
+                match file.read_to_string(&mut contents) {
+                    Ok(_) => Ok(Response::builder().status(200)
+                                .body(Body::from(contents)).unwrap()),
+                    Err(error) => Err(error),
+                }
+            },
+
+            Err(error) => {
+                match error.kind() {
+                    NotFound => Ok(
+                        Response::builder().status(404)
+                            .body(Body::empty()).unwrap()
+                    ),
+                    _ => Err(error),
+                }
+            },
+        };
+
+        Poll::Ready(response)
     }
 }
 
@@ -73,11 +111,16 @@ impl Future for StaticFileFuture {
 #[derive(Clone)]
 struct DevProxService {
     root: PathBuf,
+    proxies: Vec<ProxyRoute>,
 }
 
 impl DevProxService {
     pub fn new(root: PathBuf) -> Self {
-        DevProxService { root }
+        DevProxService { root, proxies: Vec::new() }
+    }
+
+    pub fn proxy(&mut self, proxy: ProxyRoute) {
+        self.proxies.push(proxy);
     }
 }
 
@@ -107,7 +150,7 @@ impl Service<Request<Body>> for DevProxService {
 
 #[tokio::main]
 async fn main() {
-    let service = DevProxService::new(PathBuf::from("."));
+    let service = DevProxService::new(current_dir().unwrap());
     hyper::Server::bind(&"127.0.0.1:3000".parse().unwrap())
         .serve(make_service_fn(|_: &AddrStream| {
             let service = service.clone();
