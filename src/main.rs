@@ -12,37 +12,92 @@
 
 use core::convert::Infallible;
 use core::task::{Context, Poll};
-use core::future::{self, Ready};
+use core::future::{self, Future};
+use core::pin::Pin;
+use std::path::PathBuf;
 
 use hyper::{
-    body::Body,
+    Body, Client,
+    client::{connect::HttpConnector, ResponseFuture},
     Request, Response,
     server::conn::AddrStream,
-    service::{make_service_fn, Service}
+    service::{make_service_fn, Service},
+    Uri,
 };
+
+///////////////////////////////////////////////////////////////////////////////
+// Proxy
+////
+
+struct ProxyRoute {
+    route: String,
+    proxy: Uri,
+    client: Client<HttpConnector>,
+}
+
+impl ProxyRoute {
+    pub fn new(route: String, proxy: Uri) -> Self {
+        Self { route, proxy, client: Client::new() }
+    }
+
+    pub fn matched(&self, path: &str) -> bool {
+        path.starts_with(&self.route)
+    }
+
+    pub fn proxy(&self, request: Request<Body>) -> ResponseFuture {
+        self.client.request(request)
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// StaticFileFuture
+////
+
+struct StaticFileFuture {
+    path: PathBuf,
+}
+
+impl Future for StaticFileFuture {
+    type Output = Response<Body>;
+    fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) ->
+        Poll<Self::Output>
+    {
+        unimplemented!()
+    }
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Service
 ////
 
-struct DevProxService;
+#[derive(Clone)]
+struct DevProxService {
+    root: PathBuf,
+}
+
+impl DevProxService {
+    pub fn new(root: PathBuf) -> Self {
+        DevProxService { root }
+    }
+}
 
 impl Service<Request<Body>> for DevProxService {
     type Response = Response<Body>;
     type Error = Infallible;
-    type Future = Ready<Result<Self::Response, Self::Error>>;
+    type Future = Pin<Box<dyn Future<
+            Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
 
     fn poll_ready(&mut self, _context: &mut Context<'_>) ->
         Poll<Result<(), Self::Error>>
     { Ok(()).into() }
 
     fn call(&mut self, _request: Request<Body>) -> Self::Future {
-        future::ready(Ok(
+        Box::pin(future::ready(Ok(
             Response::builder()
                 .status(200)
                 .body(Body::from("Hello, world!"))
                 .unwrap()
-        ))
+        )))
     }
 }
 
@@ -52,9 +107,11 @@ impl Service<Request<Body>> for DevProxService {
 
 #[tokio::main]
 async fn main() {
+    let service = DevProxService::new(PathBuf::from("."));
     hyper::Server::bind(&"127.0.0.1:3000".parse().unwrap())
         .serve(make_service_fn(|_: &AddrStream| {
-            async move { Ok::<_, Infallible>(DevProxService) }
+            let service = service.clone();
+            async move { Ok::<_, Infallible>(service) }
         }))
         .await
         .unwrap();
